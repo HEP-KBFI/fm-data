@@ -1,0 +1,83 @@
+# Ntupelization of the ALEPH data (EDM4hep, LEP data revival, production l2e-prod-v1) to event
+# tables (same format as the CLD ones, see fm_data/ee_sim/config/cld.yaml) and jet tables of all
+# selected jets (real data: no truth labels). One sample per year: each year is written to its
+# own directory, years are never mixed.
+#
+#   ./run.sh python3 scripts/ntupelize.py --config-path ../fm_data/lep/config --config-name aleph [overrides]
+#   CONFIG=lep/aleph ./submit.sh [overrides]        # SLURM array + dependent rechunk job
+#
+# Output (<year> = ALEPH1990, ..., ALEPH1994_old, ALEPH1995):
+#   <output_dir>/<year>/events/data_<year>_<index>_1.parquet        one file per ROOT file
+#   <output_dir>/<year>/jets_<algorithm>/data_<year>_<chunk>.parquet jets_per_file jets each
+#   <output_dir>/<year>/unchunked/jets_<algorithm>/...              per-ROOT-file jet tables
+
+output_dir: /local/laurits/20261108_ALEPH_ntupelized
+sample_subdirs: true
+
+# one task per ROOT file (up to ~160k events per file)
+files_per_output: 1
+max_files_per_sample: null
+# jet tables are rechunked per sample (year) into files of exactly this many jets (mode=rechunk)
+jets_per_file: 100000
+
+mode: run
+task_id: null
+overwrite: false
+
+aleph_sample: &aleph
+  format: aleph
+  input_dir: null
+  file_pattern: "*_AL.root"
+  file_number_regex: '^[A-Z]+(\d+)_(\d+)_AL\.root$'  # Y15224_13_AL.root -> 15224013
+  events_per_file_max: 1000000  # event_id = file number * this + entry
+  # nominal sqrt(s) for all events: RunInformation[0] (beam energy) is unreliable in
+  # 1990-1993 and 1995 (docs/lep/l2e_validation/README.md)
+  sqrt_s: 91.2
+  label: ALEPH  # event tables get label_ALEPH = 1
+  truth_objects: null
+  jet_tables: all  # data: all selected jets, unlabelled
+
+samples:
+  ALEPH1990:
+    <<: *aleph
+    input_dir: /local/laurits/FM/l2e-prod-v1/DATA/1990
+  ALEPH1991:
+    <<: *aleph
+    input_dir: /local/laurits/FM/l2e-prod-v1/DATA/1991
+  ALEPH1992:
+    <<: *aleph
+    input_dir: /local/laurits/FM/l2e-prod-v1/DATA/1992
+  ALEPH1993:
+    <<: *aleph
+    input_dir: /local/laurits/FM/l2e-prod-v1/DATA/1993
+  ALEPH1994:
+    <<: *aleph
+    input_dir: /local/laurits/FM/l2e-prod-v1/DATA/1994
+  ALEPH1994_old:
+    <<: *aleph
+    input_dir: /local/laurits/FM/l2e-prod-v1/DATA/1994_old
+  ALEPH1995:
+    <<: *aleph
+    input_dir: /local/laurits/FM/l2e-prod-v1/DATA/1995
+
+# jet selection (as in the earlier ALEPH jet-level ntuples)
+jet_selection:
+  min_energy: 1.0  # GeV
+  max_abs_eta: 3.0
+
+# fastjet ee_genkt (p = -1: ee anti-kt, p = 0: ee Cambridge/Aachen), one jet table each
+jet_algorithms:
+  ee_antikt_R04:
+    p: -1
+    R: 0.4
+    n_exclusive_jets: null
+  ee_cambridge_exclusive2:
+    p: 0
+    R: 3.141593
+    n_exclusive_jets: 2
+
+slurm:
+  partition: main
+  mem: 30G
+  time: "06:00:00"
+  max_concurrent: 150

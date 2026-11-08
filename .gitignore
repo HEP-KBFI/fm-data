@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# fm-data
+logs/
+outputs/
+*.parquet.tmp

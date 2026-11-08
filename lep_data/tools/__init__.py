@@ -1,1 +1,0 @@
-"""Shared kinematic helpers."""

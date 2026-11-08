@@ -1,0 +1,74 @@
+# Ntupelization of EDM4hep ROOT files (CLD simulation) to event and jet parquet files.
+#
+# Output layout (one file per task = files_per_output ROOT files of one sample):
+#   <output_dir>/events/data_<sample>_<index>_1.parquet           one row per event
+#   <output_dir>/jets_<algorithm>/data_<sample>_<index>_1.parquet  one row per labelled jet
+#   <output_dir>/ntupelize_config.yaml                             the config of the production
+#
+# Run (see README.md; this is the default config of scripts/ntupelize.py):
+#   ./run.sh python3 scripts/ntupelize.py [overrides]              # all tasks
+#   ./run.sh python3 scripts/ntupelize.py mode=n_tasks             # number of tasks
+#   ./submit.sh [overrides]                                                   # SLURM job array
+
+output_dir: /local/laurits/CLD_ntuples
+
+# number of ROOT files per output file (CLD files have 100 events each)
+files_per_output: 500
+# only use the first N (sorted) files of each sample, null for all
+max_files_per_sample: null
+
+# run: process the task `task_id` (or $SLURM_ARRAY_TASK_ID, or all tasks if neither is set)
+# n_tasks: print the number of tasks; setup: create the output dir and save the config
+mode: run
+task_id: null
+# redo tasks whose output files exist already
+overwrite: false
+
+collections:
+  reco_particles: PandoraPFOs
+  tracks: SiTracks_Refitted
+  vertices: PrimaryVertices
+  mc_particles: MCParticles
+
+samples:
+  Zqq:
+    format: cld
+    input_dir: /local/joosep/mlpf/cld/v1.3.0_key4hep_2026-04-08/gen/p8_ee_Z_qq_ecm91/root
+    file_pattern: "*.root"
+    file_number_regex: '_(\d+)\.root$'  # e.g. reco_p8_ee_Z_qq_ecm91_604833.root -> 604833
+    events_per_file_max: 10000  # event_id = file number * this + entry
+    sqrt_s: 91.0  # GeV, stored as event_sqrt_s (checked against the beam particles)
+    truth_objects: quarks  # jets are labelled by the matched quark of the hard process
+  Ztautau:
+    format: cld
+    input_dir: /local/joosep/mlpf/cld/v1.3.0_key4hep_2026-04-08/gen/p8_ee_Z_tautau_ecm91/root
+    file_pattern: "*.root"
+    file_number_regex: '_(\d+)\.root$'
+    events_per_file_max: 10000
+    sqrt_s: 91.0
+    truth_objects: hadronic_taus  # jets are labelled by the matched hadronic tau (visible p4)
+
+# jet selection before the truth matching (as in the ALEPH jet-level ntuples)
+jet_selection:
+  min_energy: 1.0  # GeV
+  max_abs_eta: 3.0
+
+# jet definitions, all fastjet ee_genkt (p = -1: ee anti-kt, p = 0: ee Cambridge/Aachen);
+# one jet table each. R is a 3D opening angle; with R >= pi no PFO is merged with the beam.
+jet_algorithms:
+  ee_antikt_R04:
+    p: -1
+    R: 0.4
+    n_exclusive_jets: null  # inclusive jets
+    max_match_angle: 0.4  # max. truth-object-jet opening angle
+  ee_cambridge_exclusive2:
+    p: 0
+    R: 3.141593
+    n_exclusive_jets: 2
+    max_match_angle: 0.8
+
+slurm:
+  partition: main
+  mem: 20G
+  time: "04:00:00"
+  max_concurrent: 30

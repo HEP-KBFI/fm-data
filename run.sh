@@ -1,16 +1,6 @@
 #!/bin/bash
-# Run a command inside the analysis container.
-#
-#   ./run.sh python3 lep_data/aleph/scripts/rechunk.py -i ... -o ...
-#
-# The generated SLURM job scripts use this as their environment_script, so the
-# path they record is the one of the checkout ntupelize_all.py was run from.
-#
-# keras is not used, but something in the image imports it and crashes without
-# a backend set.
-export KERAS_BACKEND=torch
-apptainer exec \
-    -B /scratch/persistent,/local,/home/laurits \
-    --env PYTHONPATH="$(pwd)" \
-    --nv \
-    /home/software/singularity/pytorch.simg:2025-09-01 "$@"
+# Run a command in the container used for the ntupelization. It needs uproot >= 5.6 to read
+# the CLD EDM4hep files (gabbro-latest.sif has uproot 5.1.2, which fails on them).
+export OPENBLAS_NUM_THREADS=1
+cd "$(dirname "${BASH_SOURCE[0]}")"
+apptainer exec -B /scratch/persistent,/local,/home --env PYTHONPATH=`pwd` /home/software/singularity/pytorch.simg:2025-09-01 "$@"
