@@ -41,6 +41,27 @@ def fill_values(array: ak.Array, fill_value: float = -999.9):
 # the other way.)
 CM_TO_MM = 10.0
 
+# Inclusive ee_genkt clustering at min_pt=0 returns every leftover soft object
+# as its own single-particle "jet": in the R=0.8 ntuple these made up 41.6% of
+# jet rows while carrying ~2% of the visible energy. Dropping jets below this
+# energy removes that clustering-noise class rather than any physical jet.
+MIN_JET_ENERGY_GEV = 1.0
+
+# ee_genkt's R is a 3D opening angle, not an eta-phi distance, so two
+# constituents can be correctly clustered together (close in 3D angle) while
+# pointing in very different (eta, phi) directions near the beam axis -- their
+# transverse momenta can then nearly cancel in the vector sum, leaving a jet
+# whose pt is a near-zero cancellation residual rather than a measure of
+# hardness (jet_pt below its own hardest constituent's part_pt). Validated
+# 2026-10-05 on /local/laurits/0930_ALEPH_raw (1M jets): this is negligible
+# below |jet_eta| ~ 2, crosses 5% of multi-particle jets by |jet_eta| ~ 2.45,
+# and reaches 50% by |jet_eta| ~ 4.25. A cut at 3.0 removes the large majority
+# of the pathology (affected fraction 2.10% -> 0.13%) for a 6.7% jet loss;
+# tightening further buys little (0.13% -> ~0% by 2.0) for steeply growing
+# loss (11.4% at 2.0, 21.4% at 1.5) -- see
+# /home/laurits/ml-tau/results/lep-data-val-plots/{20_pt_cancellation,21_eta_cut_comparison}.png.
+MAX_ABS_JET_ETA = 3.0
+
 
 def calculate_impact_parameters(
     events: ak.Array, track_states_collection: str = "_Tracks_trackStates"
@@ -94,6 +115,7 @@ def calculate_impact_parameters(
             f"{n_multiple} events have more than one vertex; the per-event "
             "vertex broadcast in calculate_impact_parameters assumes at most one"
         )
+    vertex_x_exists = n_vertices > 0
     vertex_x = ak.flatten(fill_values(CM_TO_MM * events["Vertices.position.x"]), axis=-1)
     vertex_y = ak.flatten(fill_values(CM_TO_MM * events["Vertices.position.y"]), axis=-1)
     vertex_z = ak.flatten(fill_values(CM_TO_MM * events["Vertices.position.z"]), axis=-1)
@@ -161,28 +183,51 @@ def calculate_impact_parameters(
         + ((vertex_y - pca_y) / dxy * pca_y_error) ** 2
     )
     dz_error = pca_z_error
-    return ak.zip(
-        {
-            "dzval": dz,
-            "dzerr": dz_error,
-            "d0val": d0,
-            "d0err": d0_error,
-            "dxy": dxy,
-            "dxyerr": dxy_error,
-        }
+    return (
+        ak.zip(
+            {
+                "dzval": dz,
+                "dzerr": dz_error,
+                "d0val": d0,
+                "d0err": d0_error,
+                "dxy": dxy,
+                "dxyerr": dxy_error,
+            }
+        ),
+        vertex_x_exists,
     )
 
 
 def assign_pid_info(arrays: ak.Array) -> ak.Array:
     """Extract particle ID info vectorized across all events"""
-    # 0:Charged hadrons, 1:Electron, 2:Muon, 3:Track from V0, 4:photons, 5:Neutral hadrons, 6:Hcalobject, 7:Lcalobject
+    # 0:Charged hadrons, 1:Electron, 2:Muon, 3:Track from V0, 4:photons,
+    # 5:Neutral hadrons, 7:Lcalobject, 8: an even more forward calo-only class
+    # than 7 (higher energy, |cos theta| up to ~0.9997 vs 7's ~0.999; neither
+    # detector nor comment for it exists in the current metadata). Type 6
+    # never occurs in these files, despite being in the original comment.
+    #
+    # Types 3, 7 and 8 get no flag here otherwise, which the downstream data
+    # never has (every candidate there is one of 11, 13, 22, 211, 130) and
+    # which left 7% of particles as an all-zero one-hot. Mapping decided
+    # 2026-09-30: type 3 is charged with a track exactly like type 0, just
+    # lower energy (a V0 daughter) -> charged hadron. Types 7 and 8 are both
+    # neutral, trackless, calorimeter-only objects sitting in the very
+    # forward region outside ECAL/HCAL's |cos theta| < ~0.98 acceptance
+    # (consistent with ALEPH's forward luminosity calorimeters, not HCAL) ->
+    # both mapped to photon, the closest available category for a neutral
+    # calorimeter-only cluster, even though physically they are more likely
+    # residual Bhabha-scattering activity than true Z-decay photons.
     pid_type = arrays["ParticleID.type"]
     return ak.zip(
         {
-            "is_charged_hadron": ak.values_astype(pid_type == 0, "int32"),
+            "is_charged_hadron": ak.values_astype(
+                (pid_type == 0) | (pid_type == 3), "int32"
+            ),
             "is_electron": ak.values_astype(pid_type == 1, "int32"),
             "is_muon": ak.values_astype(pid_type == 2, "int32"),
-            "is_photon": ak.values_astype(pid_type == 4, "int32"),
+            "is_photon": ak.values_astype(
+                (pid_type == 4) | (pid_type == 7) | (pid_type == 8), "int32"
+            ),
             "is_neutral_hadron": ak.values_astype(pid_type == 5, "int32"),
         }
     )
@@ -204,18 +249,41 @@ def get_cand_info(events: ak.Array) -> ak.Array:
 
     # Get PID info
     pid_info = assign_pid_info(events)
-    impact_parameters = calculate_impact_parameters(events=events)
+    impact_parameters, vertex_exists = calculate_impact_parameters(events=events)
     # Gather the track state of each particle by position, so that the values
     # line up with the particles they belong to whatever order the collection
     # is in, and give the neutral (trackless) ones the missing-value marker.
     state_index, has_track = find_linked_indices(events=events)
     impact_parameters = impact_parameters[state_index]
+
+    # dxy/dz are measured against the event's primary vertex, so they are only
+    # meaningful when that vertex actually exists; d0/z0 are relative to the
+    # track's own reference point and do not depend on it. Without this split,
+    # a vertex-less event's dxy/dz were measured against the -999.9 fill
+    # position and looked like real ~1 m displacements (see calculate_impact_
+    # parameters' warning) instead of being flagged missing like everything
+    # else here.
+    vertex_dependent = {"dxy", "dxyerr", "dzval", "dzerr"}
     impact_parameters = ak.zip(
         {
-            field: ak.where(has_track, impact_parameters[field], -999.9)
+            field: ak.where(
+                has_track & vertex_exists if field in vertex_dependent else has_track,
+                impact_parameters[field],
+                -999.9,
+            )
             for field in impact_parameters.fields
         }
     )
+
+    # Significances are zero-filled, never the -999.9 sentinel, so the
+    # tokenizer reads "no measured impact parameter" as 0 rather than as an
+    # extreme value; guard the denominator so a masked (-999.9) or otherwise
+    # non-positive error never enters the division.
+    sig_valid = (impact_parameters["dxyerr"] > 0) & (impact_parameters["dzerr"] > 0)
+    safe_dxyerr = ak.where(sig_valid, impact_parameters["dxyerr"], 1.0)
+    safe_dzerr = ak.where(sig_valid, impact_parameters["dzerr"], 1.0)
+    part_dxysig = ak.where(sig_valid, impact_parameters["dxy"] / safe_dxyerr, 0.0)
+    part_dzsig = ak.where(sig_valid, impact_parameters["dzval"] / safe_dzerr, 0.0)
 
     # Combine everything into one structure (all vectorized)
     particle_data = ak.zip(
@@ -231,8 +299,12 @@ def get_cand_info(events: ak.Array) -> ak.Array:
             "part_mass": cand_p4.mass,
             "part_d0val": impact_parameters["d0val"],
             "part_d0err": impact_parameters["d0err"],
+            "part_dxy": impact_parameters["dxy"],
+            "part_dxyerr": impact_parameters["dxyerr"],
             "part_dzval": impact_parameters["dzval"],
             "part_dzerr": impact_parameters["dzerr"],
+            "part_dxysig": part_dxysig,
+            "part_dzsig": part_dzsig,
             "part_charge": events["RecoParticles.charge"],
             "part_isChargedHadron": pid_info["is_charged_hadron"],
             "part_isNeutralHadron": pid_info["is_neutral_hadron"],
@@ -329,8 +401,11 @@ def get_jet_basic_properties(
     jet_p4: ak.Array,
     jet_assigned_particles: ak.Array,
     counts_per_jet: ak.Array,
+    jet_R: float,
+    sqrt_s_gev: ak.Array,
 ):
     """Compute basic jet-level properties from clustered jet p4s and their constituents."""
+    jet_sqrt_s, _ = ak.broadcast_arrays(sqrt_s_gev, jet_p4.pt)
     jet_data = ak.zip(
         {
             "jet_pt": jet_p4.pt,
@@ -338,30 +413,43 @@ def get_jet_basic_properties(
             "jet_phi": jet_p4.phi,
             "jet_energy": jet_p4.energy,
             "jet_mass": jet_p4.mass,
-            "jet_sdmass": jvc.calculate_sdmass_ee(jet_assigned_particles),
+            # Polar angle of the jet axis: needed to turn the (eta, phi)-frame
+            # particle features into true angles relative to the jet (see
+            # part_etarel_R/part_phirel_R below), since this jet definition's R
+            # is a 3D opening angle, not an eta-phi radius.
+            "jet_theta": 2 * np.arctan(np.exp(-jet_p4.eta)),
+            "jet_R": ak.full_like(jet_p4.pt, jet_R),
+            "jet_is_ee": ak.values_astype(ak.ones_like(jet_p4.pt), "int32"),
+            "jet_is_pp": ak.values_astype(ak.zeros_like(jet_p4.pt), "int32"),
+            "jet_sqrt_s": jet_sqrt_s,
+            "jet_sdmass": jvc.calculate_sdmass_ee(jet_assigned_particles, R0=jet_R),
             "jet_tau1": jvc.calculate_tau_n_ee(
                 jet_assigned_particles.part_pt,
                 jet_assigned_particles.part_eta,
                 jet_assigned_particles.part_phi,
                 Naxes=1,
+                R0=jet_R,
             ),
             "jet_tau2": jvc.calculate_tau_n_ee(
                 jet_assigned_particles.part_pt,
                 jet_assigned_particles.part_eta,
                 jet_assigned_particles.part_phi,
                 Naxes=2,
+                R0=jet_R,
             ),
             "jet_tau3": jvc.calculate_tau_n_ee(
                 jet_assigned_particles.part_pt,
                 jet_assigned_particles.part_eta,
                 jet_assigned_particles.part_phi,
                 Naxes=3,
+                R0=jet_R,
             ),
             "jet_tau4": jvc.calculate_tau_n_ee(
                 jet_assigned_particles.part_pt,
                 jet_assigned_particles.part_eta,
                 jet_assigned_particles.part_phi,
                 Naxes=4,
+                R0=jet_R,
             ),
         }
     )
@@ -410,6 +498,9 @@ def get_all_properties(
     Pads the particle axis (axis=-1) but does NOT flatten the jet axis.
     The caller is responsible for the final axis=1 flatten.
     """
+    part_etarel = f.signedDeltaEta(jet_assigned_particles.part_eta, jet_data.jet_eta)
+    part_phirel = f.signedDeltaPhi(jet_assigned_particles.part_phi, jet_data.jet_phi)
+
     # Build combined dict with all fields at [events, jets, ...]
     combined = {
         # Jet-level fields: [events, jets]
@@ -417,12 +508,15 @@ def get_all_properties(
         # Particle-relative-to-jet variables: [events, jets, particles]
         "part_ptrel": jet_assigned_particles.part_pt / jet_data.jet_pt,
         "part_erel": jet_assigned_particles.part_energy / jet_data.jet_energy,
-        "part_etarel": f.signedDeltaEta(
-            jet_assigned_particles.part_eta, jet_data.jet_eta
-        ),  # part_signed_deta ; to have same field names as in the JetClass dataset
-        "part_phirel": f.signedDeltaPhi(
-            jet_assigned_particles.part_phi, jet_data.jet_phi
-        ),  # part_signed_dphi ; to have same field names as in the JetClass dataset
+        "part_logptrel": np.log(jet_assigned_particles.part_pt / jet_data.jet_pt),
+        "part_etarel": part_etarel,  # part_signed_deta ; to have same field names as in the JetClass dataset
+        "part_phirel": part_phirel,  # part_signed_dphi ; to have same field names as in the JetClass dataset
+        # sin(jet_theta) turns the (eta, phi) offset into a true angle, since
+        # this jet's R is a 3D opening angle, not a Δη/Δφ radius; dividing by
+        # jet_R puts the jet boundary at ~1, matching the pp-style part_etarel
+        # / jet_R definition these fields share a name with.
+        "part_etarel_R": part_etarel * np.sin(jet_data.jet_theta) / jet_data.jet_R,
+        "part_phirel_R": part_phirel * np.sin(jet_data.jet_theta) / jet_data.jet_R,
         "part_deltaR": f.deltaR_etaPhi(
             jet_assigned_particles.part_eta,
             jet_assigned_particles.part_phi,
@@ -449,8 +543,8 @@ def get_all_properties(
     return combined
 
 
-def construct_jet_based_dataset(events: ak.Array):
-    """Cluster particles to jets with fastjet (R=0.8) and build the combined dict at [events, jets, ...] level.
+def construct_jet_based_dataset(events: ak.Array, jet_R: float = 0.4):
+    """Cluster particles to jets with fastjet ee_genkt (R=jet_R) and build the combined dict at [events, jets, ...] level.
 
     Returns:
         Tuple of (jet_data_dict, particle_data):
@@ -461,7 +555,7 @@ def construct_jet_based_dataset(events: ak.Array):
 
     # Cluster particles into jets using fastjet
     jet_p4, constituent_indices = cluster_particles_to_jets(
-        particle_data, deltar=0.8, min_pt=0.0
+        particle_data, deltar=jet_R, min_pt=0.0
     )
 
     # Group particle data per jet using cluster constituent indices
@@ -481,10 +575,19 @@ def construct_jet_based_dataset(events: ak.Array):
         ]
     )
 
+    # RunInformation[..., 0] is the beam energy in MeV; it is duplicated
+    # identically across every event in a run (verified on sample files), but
+    # is read per event rather than hardcoded so a different run's
+    # centre-of-mass energy would be honoured automatically.
+    beam_energy_gev = events["RunInformation"][:, 0] / 1000.0
+    sqrt_s_gev = 2.0 * beam_energy_gev
+
     jet_data = get_jet_basic_properties(
         jet_p4=jet_p4,
         jet_assigned_particles=jet_assigned_particles,
         counts_per_jet=num_ptcls_per_jet,
+        jet_R=jet_R,
+        sqrt_s_gev=sqrt_s_gev,
     )
     all_properties = get_all_properties(
         jet_data=jet_data,
@@ -495,7 +598,10 @@ def construct_jet_based_dataset(events: ak.Array):
 
 
 def build_dataset(
-    input_path: str, jet_level: bool = False, event_level: bool = True
+    input_path: str,
+    jet_level: bool = False,
+    event_level: bool = True,
+    jet_R: float = 0.4,
 ) -> ak.Array:
     """Ntupelize one ROOT file and return the dataset, without writing it.
 
@@ -513,16 +619,20 @@ def build_dataset(
             f"jet_level={jet_level}, event_level={event_level}"
         )
     events = load_file_contents(path=input_path, tree_name="events")
-    combined_jet, particle_data = construct_jet_based_dataset(events)
+    combined_jet, particle_data = construct_jet_based_dataset(events, jet_R=jet_R)
+    beam_energy_gev = events["RunInformation"][:, 0] / 1000.0
 
     # Flatten from [events, jets, ...] to [total_jets, ...] at the very end
     if jet_level:
         jet_dataset = ak.Array(
             {k: ak.flatten(combined_jet[k], axis=1) for k in combined_jet.fields}
         )
+        # jet_sqrt_s is already carried per jet, so the beam energy for the
+        # particle cut below is just half of it -- no separate broadcast needed.
+        jet_beam_energy_gev = jet_dataset.jet_sqrt_s / 2.0
         bad_particle = (
             (jet_dataset.part_pt <= 0)
-            | (jet_dataset.part_energy >= 45.6)
+            | (jet_dataset.part_energy >= jet_beam_energy_gev)
             | (jet_dataset.part_pt == -999.9)
             | (~np.isfinite(jet_dataset.part_pt))
         )
@@ -530,15 +640,20 @@ def build_dataset(
         valid_jets = (
             (jet_dataset.jet_pt > 0)
             & np.isfinite(jet_dataset.jet_eta)
-            & (jet_dataset.jet_energy <= 91.2)
+            & (jet_dataset.jet_energy <= jet_dataset.jet_sqrt_s)
+            & (jet_dataset.jet_energy > MIN_JET_ENERGY_GEV)
+            & (np.abs(jet_dataset.jet_eta) < MAX_ABS_JET_ETA)
         )
         return jet_dataset[(~jet_contains_bad_particle) * valid_jets]
 
     if event_level:
         # Merge jet-level [events, jets, ...] with event-level [events] fields
+        beam_energy_bcast, _ = ak.broadcast_arrays(
+            beam_energy_gev, particle_data.part_pt
+        )
         bad_particle = (
             (particle_data.part_pt <= 0)
-            | (particle_data.part_energy >= 45.6)
+            | (particle_data.part_energy >= beam_energy_bcast)
             | (particle_data.part_pt == -999.9)
             | (~np.isfinite(particle_data.part_pt))
         )
@@ -546,11 +661,15 @@ def build_dataset(
         # jet_pt <= 0, not < 0: a zero-pt jet is as unusable as a negative one,
         # and the jet-level branch above already rejects it via `jet_pt > 0`.
         # Keeping the two branches on the same cut means a jet is not kept at one
-        # output level and dropped at the other.
+        # output level and dropped at the other. Same for jet_energy <=
+        # MIN_JET_ENERGY_GEV (complement of the jet-level branch's > cut) and
+        # for |jet_eta| >= MAX_ABS_JET_ETA (complement of its < cut).
         bad_jets = (
             (combined_jet.jet_pt <= 0)
             | ~np.isfinite(combined_jet.jet_eta)
-            | (combined_jet.jet_energy > 91.2)
+            | (combined_jet.jet_energy > combined_jet.jet_sqrt_s)
+            | (combined_jet.jet_energy <= MIN_JET_ENERGY_GEV)
+            | (np.abs(combined_jet.jet_eta) >= MAX_ABS_JET_ETA)
         )
         event_contains_bad_jet = ak.any(bad_jets, axis=-1)
         event_mask_ = ak.num(combined_jet.jet_pt) > 0
@@ -579,6 +698,7 @@ def ntupelize_file(
     jet_level: bool = False,
     event_level: bool = True,
     row_group_size: int = 1024,
+    jet_R: float = 0.4,
 ):
     """Ntupelize one ROOT file into one .parquet file.
 
@@ -586,7 +706,10 @@ def ntupelize_file(
     instead, see scripts/ntupelize_list.py.
     """
     dataset = build_dataset(
-        input_path=input_path, jet_level=jet_level, event_level=event_level
+        input_path=input_path,
+        jet_level=jet_level,
+        event_level=event_level,
+        jet_R=jet_R,
     )
     ak.to_parquet(
         dataset,

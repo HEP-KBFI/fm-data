@@ -41,6 +41,7 @@ def main(cfg: DictConfig) -> None:
     output_level = cfg.get("output_level", "event")
     jets_per_file = cfg.get("jets_per_file", ch.DEFAULT_JETS_PER_FILE)
     row_group_size = cfg.get("row_group_size", ch.DEFAULT_ROW_GROUP_SIZE)
+    jet_R = cfg.get("jet_R", 0.4)
     if output_level not in ("event", "jet"):
         raise ValueError(f"output_level must be 'event' or 'jet', got {output_level!r}")
 
@@ -54,6 +55,7 @@ def main(cfg: DictConfig) -> None:
                 input_path=input_path,
                 jet_level=output_level == "jet",
                 event_level=output_level == "event",
+                jet_R=jet_R,
             )
         except Exception as error:
             # One unreadable ROOT file should not throw away the rest of the job.

@@ -24,6 +24,7 @@ def submit_slurm_job(
     idx: int,
     jets_per_file: int,
     row_group_size: int,
+    jet_R: float,
 ) -> str:
     """Write the SLURM job script for processing a chunk of input files.
 
@@ -65,6 +66,7 @@ def submit_slurm_job(
         output_level=output_level,
         jets_per_file=jets_per_file,
         row_group_size=row_group_size,
+        jet_R=jet_R,
     )
 
     with open(job_script_path, "wt") as f:
@@ -92,6 +94,7 @@ def main(cfg: DictConfig) -> None:
     output_level = cfg.output_level
     jets_per_file = cfg.get("jets_per_file", 100_000)
     row_group_size = cfg.get("row_group_size", 1024)
+    jet_R = cfg.get("jet_R", 0.4)
 
     input_wcp = os.path.join(input_dir, "*", "data_*.root")
     input_paths = list(glob.glob(input_wcp))
@@ -107,6 +110,7 @@ def main(cfg: DictConfig) -> None:
             idx=i,
             jets_per_file=jets_per_file,
             row_group_size=row_group_size,
+            jet_R=jet_R,
         )
 
 
