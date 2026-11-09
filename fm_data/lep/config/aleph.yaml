@@ -77,7 +77,7 @@ jet_algorithms:
     n_exclusive_jets: 2
 
 slurm:
-  partition: main
+  partition: main,short  # tasks take < 3 min, rechunks < 1 h
   mem: 30G
-  time: "06:00:00"
+  time: "02:00:00"
   max_concurrent: 150

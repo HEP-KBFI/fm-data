@@ -160,9 +160,20 @@ def count_heavy_hadrons_in_jets(jets, heavy_hadrons, flavour, max_angle=None):
     return ak.sum(jet_index[:, :, None] == closest_jet[:, None, :], axis=2)
 
 
-def _signed_impact_parameters(parts, jets, vertex):
+# components of (PCA - reference point) and of the jet axis used to sign each impact parameter:
+# "3d" (CLD: 3D PCA to the primary vertex) signs all of them with the 3D dot product;
+# "transverse" (ALEPH: transverse PCA to the beam spot, whose z offset is the poorly measured dz)
+# signs dxy and d3 with the transverse dot product and dz with the z components.
+IP_SIGNING = {
+    "3d": {"dxy": "xyz", "dz": "xyz", "d3": "xyz"},
+    "transverse": {"dxy": "xy", "dz": "z", "d3": "xy"},
+}
+
+
+def _signed_impact_parameters(parts, jets, vertex, ip_signing="3d"):
     """Impact parameters signed w.r.t. the jet axis (lifetime.calc_signed_impact_parameters:
-    positive if the point of closest approach lies in the jet direction).
+    positive if the point of closest approach lies in the jet direction), with the components
+    given by IP_SIGNING[ip_signing].
 
     Parameters
     ----------
@@ -183,18 +194,23 @@ def _signed_impact_parameters(parts, jets, vertex):
     jet_px, jet_py, jet_pz = (per_constituent(getattr(jets, axis)) for axis in ("px", "py", "pz"))
     vtx = {axis: per_constituent(ak.Array(vertex[axis])) for axis in "xyz"}
     columns = {}
+    jet_p = {"x": jet_px, "y": jet_py, "z": jet_pz}
     for name in SIGNED_IP_VARIABLES:
+        axes = IP_SIGNING[ip_signing][name]
+        # components not used for the sign: PCA = reference point and jet component 0
+        pca = {axis: flat[f"part_pca_{axis}"] if axis in axes else vtx[axis] for axis in "xyz"}
+        jet = {axis: jet_p[axis] if axis in axes else np.zeros_like(jet_p[axis]) for axis in "xyz"}
         signed = lt.calc_signed_impact_parameters(
             ak.to_numpy(ak.flatten(parts[f"part_{name}"])),
-            flat["part_pca_x"],
-            flat["part_pca_y"],
-            flat["part_pca_z"],
+            pca["x"],
+            pca["y"],
+            pca["z"],
             vtx["x"],
             vtx["y"],
             vtx["z"],
-            jet_px,
-            jet_py,
-            jet_pz,
+            jet["x"],
+            jet["y"],
+            jet["z"],
         )
         columns[f"part_{name}_signed"] = ak.unflatten(signed, counts)
         columns[f"part_{name}_signed_sig"] = significance(
@@ -240,7 +256,46 @@ def _jet_and_relative_features(jets, parts):
     }
 
 
-def build_jet_table(event_table, algorithm, selection, truth=None, heavy_hadrons=None):
+def extended_features(jet_theta, part_etarel, part_phirel, part_ptrel, R):
+    """Constituent coordinates scaled to the jet radius, as the tokeniser / backbone of the
+    jet foundation models (gabbro, feature dict *_extended_features_*_new_features) expect.
+
+    The jets are e+e- jets: R is an opening angle. Near the jet axis a step in eta is a polar
+    angle step sin(theta) * deta and a step in phi an arc sin(theta) * dphi, so with the jet's
+    sin(theta) the cone of opening angle R becomes the unit disk for any jet direction:
+        part_etarel_R = sin(theta_jet) * part_etarel / R
+        part_phirel_R = sin(theta_jet) * part_phirel / R
+        part_logptrel = log(pt / pt_jet)
+
+    Parameters
+    ----------
+    jet_theta : array [jets]
+    part_etarel, part_phirel, part_ptrel : ak.Array [jets, PFOs]
+    R : float
+        Jet radius (opening angle) of the clustering.
+    """
+    sin_theta = np.sin(jet_theta)[:, None]
+    return {
+        "part_etarel_R": sin_theta * part_etarel / R,
+        "part_phirel_R": sin_theta * part_phirel / R,
+        "part_logptrel": np.log(part_ptrel),
+    }
+
+
+def collider_features(n_jets, R, sqrt_s):
+    """Per-jet constants telling the foundation models which collider / jet definition the
+    jet comes from (jet_R, jet_is_ee, jet_is_pp, jet_sqrt_s)."""
+    return {
+        "jet_R": np.full(n_jets, R, dtype=np.float32),
+        "jet_is_ee": np.ones(n_jets, dtype=np.int32),
+        "jet_is_pp": np.zeros(n_jets, dtype=np.int32),
+        "jet_sqrt_s": np.asarray(sqrt_s, dtype=np.float32),
+    }
+
+
+def build_jet_table(
+    event_table, algorithm, selection, truth=None, heavy_hadrons=None, ip_signing="3d"
+):
     """Cluster jets from the PFOs of the event table, one row per kept jet.
 
     Parameters
@@ -259,6 +314,8 @@ def build_jet_table(event_table, algorithm, selection, truth=None, heavy_hadrons
     heavy_hadrons : ak.Array, optional
         Weakly decaying b/c hadrons of the same events (`truth.MCTruth.heavy_hadrons`),
         required with `truth`.
+    ip_signing : str
+        "3d" or "transverse", see IP_SIGNING.
 
     Returns
     -------
@@ -329,10 +386,18 @@ def build_jet_table(event_table, algorithm, selection, truth=None, heavy_hadrons
         for name, pdg_ids in LABEL_CLASSES.items():
             columns[f"label_{name}"] = np.isin(abs_pdg, pdg_ids).astype(np.int32)
     columns |= _jet_and_relative_features(jets, parts)
+    if algorithm.get("n_exclusive_jets") is None:
+        # (exclusive jets have no radius to scale to)
+        R = float(algorithm["R"])
+        columns |= extended_features(
+            columns["jet_theta"], columns["part_etarel"], columns["part_phirel"],
+            columns["part_ptrel"], R,
+        )
+        columns |= collider_features(len(jets), R, columns["event_sqrt_s"])
     columns |= {field: parts[field] for field in parts.fields}
     # the PCA is computed w.r.t. the reference point of the impact parameters: the primary
     # vertex (CLD) or, if the reader provides one, event_ref_* (ALEPH: beam spot)
     origin = "event_ref" if "event_ref_x" in columns else "event_vertex"
     vertex = {axis: columns[f"{origin}_{axis}"] for axis in "xyz"}
-    columns |= _signed_impact_parameters(parts, jets, vertex)
+    columns |= _signed_impact_parameters(parts, jets, vertex, ip_signing)
     return ak.Array(columns)

@@ -77,9 +77,12 @@ class JetChunkWriter:
         jets_per_file=DEFAULT_JETS_PER_FILE,
         row_group_size=DEFAULT_ROW_GROUP_SIZE,
         jet_field=JET_FIELD,
+        first_index=0,
     ):
         self.output_dir = output_dir
         self.prefix = prefix
+        # index of the first file written, to continue a numbered series
+        self.first_index = int(first_index)
         self.schema = plain_schema(schema)
         self.jets_per_file = int(jets_per_file)
         self.row_group_size = int(row_group_size)
@@ -130,7 +133,7 @@ class JetChunkWriter:
         """Write everything buffered as one output file."""
         if not self._buffer:
             return
-        path = self.path(len(self.paths))
+        path = self.path(self.first_index + len(self.paths))
         table = pa.concat_tables(self._buffer)
         with pq.ParquetWriter(
             path,

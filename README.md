@@ -23,8 +23,10 @@ fm_data/
                 chunking.py         rechunking parquet files into N jets per file
   lep/        ALEPH: reader aleph.py, config/aleph.yaml, notebooks/
   ee_sim/     CLD: reader cld.py and reading.py, MC truth truth.py, config/cld.yaml
-scripts/      ntupelize.py (hydra entry point), rechunk.py (stand-alone rechunking)
+scripts/      ntupelize.py (hydra entry point), rechunk.py (stand-alone rechunking),
+              combine_samples.py (several samples into one, e.g. all ALEPH years)
 docs/lep/     ALEPH: l2e_validation/ (validation of l2e-prod-v1, converter_issues.md),
+              ntuple_validation/ (plots of the ntuples), run_quality/ (runs vs ALEPH bookkeeping),
               aleph_ip_validation.md (impact parameters), CHANGES_since_June2025_production.txt
               (converter change log), and the older lep-data notes (dR cut, overview)
 tests/        ./run.sh python3 -m pytest tests (unit tests, one CLD and one ALEPH file end to end)
@@ -82,8 +84,8 @@ CONFIG=lep/aleph ./submit.sh output_dir=/local/$USER/other slurm.max_concurrent=
 
 1. saves the config to `<output_dir>/ntupelize_config.yaml` (`mode=setup`);
 2. submits one SLURM array task per output file (`mode=run task_id=...`);
-3. if the config has `jets_per_file`, submits a `mode=rechunk` job that runs once the array
-   is done (`--dependency=afterany`).
+3. if the config has `jets_per_file`, submits one `mode=rechunk` job per sample that runs
+   once the array is done (`--dependency=afterany`).
 
 Tasks whose output files exist are skipped (`overwrite=true` redoes them), so a failed array
 can simply be resubmitted. The rechunk refuses to run while a task output is missing, or if its
@@ -158,6 +160,29 @@ Here `<year>` is one of 1990, 1991, 1992, 1993, 1994, 1994_old or 1995. The curr
 production is in `/local/laurits/20261108_ALEPH_ntupelized`. The rows are in input order (by
 file, then entry), not shuffled.
 
+**Combined sample `ALEPH_combined`:** all years, with 1994_old in place of 1994. It has the
+same three tables, with all columns including the impact parameters, as
+`ALEPH_combined/<table>/data_ALEPH_combined_<chunk>.parquet`, plus `manifest.csv`, which gives
+the source of every file.
+- Contents: 10.3M events, 32.3M R=0.4 jets and 15.7M exclusive 2-jet jets.
+- How it is made: the full 100k files of the years are copied in year order, and the partial
+  last file of each year is rechunked at the end. So every file holds 100k jets except the
+  last, and only the last few files mix years.
+- Remaking it after a new production:
+
+```bash
+./run.sh python3 scripts/combine_samples.py --base-dir /local/laurits/20261108_ALEPH_ntupelized \
+    --name ALEPH_combined --samples ALEPH1990 ALEPH1991 ALEPH1992 ALEPH1993 ALEPH1994_old ALEPH1995
+```
+
+**Run quality** (`docs/lep/run_quality/`):
+- All runs of 1990–1994 are in ALEPH's good-run list (SCANBOOK), and SCANBOOK does not cover
+  1995.
+- No run needs to be removed for physics without impact parameters.
+- About 55 runs (0.2 % of hadronic events) have a degraded dxy resolution.
+- 20–31 % of the hadronic events of 1990, 1991 and 1993 were taken off peak (√s up to ±2 GeV
+  from 91.2). The per-run LEP energies are in `runs.csv`.
+
 What the reader does about the files (details in the docstring of `fm_data/lep/aleph.py`):
 
 - **Units and sign:** lengths are converted from cm (what the files contain) to mm, and the
@@ -176,6 +201,11 @@ What the reader does about the files (details in the docstring of `fm_data/lep/a
     its error.
   - The ALEPH event vertex (`event_vertex_*`) is kept but not used: it is missing in 60–90 %
     of the events.
+- **Lifetime sign:** the jet tables sign `dxy` and `d3` with the transverse components of
+  (PCA − reference) and of the jet axis, and `dz` with the z components
+  (`ip_signing="transverse"`). The 3D dot product used for CLD would let the poorly measured
+  z offset of the transverse PCA decide the sign. In 1994_old, N(sig > 3)/N(sig < −3) is 2.6
+  with the transverse signing and 1.6 with the 3D one.
 - **√s** is the nominal 91.2 GeV for all events, because the beam energy in `RunInformation`
   is in GeV, missing or meaningless for parts of 1990–1993 and 1995.
 
@@ -227,7 +257,7 @@ Each row holds the event columns of its event (repeated per jet), and:
 | `part_*` (all event-table PFO columns) | the constituents, sorted by pt |
 | `part_event_index` | **position of the constituent in the event's PFO list (link to the event table)** |
 | `part_ptrel`, `part_erel`, `part_etarel`, `part_phirel`, `part_deta`, `part_dphi`, `part_deltaR`, `part_angle` | constituent kinematics relative to the jet (`part_angle`: 3D opening angle) |
-| `part_{dxy,dz,d3}_signed` + `_sig` | impact parameters signed w.r.t. the jet axis: positive if the PCA lies in the jet direction from the reference point |
+| `part_{dxy,dz,d3}_signed` + `_sig` | impact parameters signed w.r.t. the jet axis: positive if the PCA lies in the jet direction from the reference point (CLD: 3D dot product; ALEPH: transverse for dxy and d3, z for dz) |
 | `label_b`, `label_c`, `label_s`, `label_ud`, `label_tau` | simulation only: one-hot label from the matched truth object |
 | `jet_truth_pdg`, `jet_truth_angle`, `jet_truth_energy` | simulation only: matched quark or tau (signed PDG id), its opening angle to the jet, its (visible) energy |
 | `jet_n_bhadrons`, `jet_n_chadrons` | simulation only: weakly decaying b/c hadrons in the jet (cross-check of the labels) |
@@ -256,6 +286,8 @@ particle type and impact parameters, and the pairwise features from the four-mom
 - The impact-parameter errors come from the track covariance only (no vertex error) and a
   straight-line approximation of the track near the vertex. The significances have
   non-Gaussian tails: in light jets about 3% of tracks have a signed significance below −3.
+- ALEPH validation plots of the ntuples: `docs/lep/ntuple_validation/`
+  (`validate_ntuples.py`).
 - ALEPH: the ntuples made before 2026-11-05 have the wrong d0 sign (see
   `docs/lep/aleph_ip_validation.md`). 1990 has no vertex detector, so its impact-parameter
   resolution is worse (d0 core about 0.37 mm, vs 0.15 mm in 1994).

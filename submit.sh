@@ -8,9 +8,9 @@
 # 1. saves the config to <output_dir>/ntupelize_config.yaml (mode=setup)
 # 2. asks for the number of tasks (mode=n_tasks)
 # 3. submits the array; each task runs `mode=run task_id=$SLURM_ARRAY_TASK_ID`
-# 4. with jets_per_file: submits `mode=rechunk` with --dependency=afterany on the array. The
-#    rechunk refuses to run if a task output is missing: then resubmit (step 3 skips tasks
-#    whose outputs exist) and rerun the rechunk.
+# 4. with jets_per_file: submits one `mode=rechunk` job per sample with --dependency=afterany
+#    on the array. A rechunk refuses to run if a task output of its sample is missing: then
+#    resubmit (step 3 skips tasks whose outputs exist) and rerun the rechunk.
 # SLURM settings come from the `slurm` section of the config (or overrides).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -44,9 +44,19 @@ ARRAY_ID="$(sbatch --parsable --array="0-$((N_TASKS - 1))%${MAX_CONCURRENT}" --p
 echo "array job ${ARRAY_ID}"
 
 if [[ "$JETS_PER_FILE" != "None" && -n "$JETS_PER_FILE" ]]; then
-    RECHUNK_ID="$(sbatch --parsable --dependency="afterany:${ARRAY_ID}" --partition="$PARTITION" \
-        --mem=16G --time=12:00:00 --job-name="rechunk-${NAME}" \
-        --output=logs/slurm/rechunk-%j.out --error=logs/slurm/rechunk-%j.err \
-        --wrap="./run.sh python3 $SCRIPT $* mode=rechunk")"
-    echo "rechunk job ${RECHUNK_ID} (after ${ARRAY_ID})"
+    # one rechunk job per sample (they are independent), each with the other samples removed
+    SAMPLES="$(./run.sh python3 -c "from omegaconf import OmegaConf; import sys; \
+cfg = OmegaConf.merge(OmegaConf.load('$CONFIG_FILE'), OmegaConf.from_dotlist(sys.argv[1:])); \
+print(' '.join(cfg.samples))" "$@" | tail -n 1)"
+    for SAMPLE in $SAMPLES; do
+        DROP=""
+        for OTHER in $SAMPLES; do
+            [[ "$OTHER" != "$SAMPLE" ]] && DROP="$DROP ~samples.$OTHER"
+        done
+        RECHUNK_ID="$(sbatch --parsable --dependency="afterany:${ARRAY_ID}" --partition="$PARTITION" \
+            --mem=16G --time=02:00:00 --job-name="rechunk-${SAMPLE}" \
+            --output=logs/slurm/rechunk-${SAMPLE}-%j.out --error=logs/slurm/rechunk-${SAMPLE}-%j.err \
+            --wrap="./run.sh python3 $SCRIPT $* mode=rechunk$DROP")"
+        echo "rechunk job ${RECHUNK_ID} for ${SAMPLE} (after ${ARRAY_ID})"
+    done
 fi

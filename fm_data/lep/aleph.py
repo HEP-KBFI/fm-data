@@ -35,7 +35,11 @@ its z is known only to ~0.6 mm, which spoils the 3D-PCA dxy. Instead:
 The ALEPH vertex is kept in event_vertex_*/event_has_vertex; the reference point is stored in
 event_ref_{x,y,z} (event_ref_from_beamspot = 1 if x, y come from the BeamSpot collection), the
 beam size in event_beam_sigma_{x,y} (all in mm). part_d0/part_z0 stay the track parameters
-w.r.t. (0, 0, 0) (sign-corrected). The jet tables sign the impact parameters w.r.t. event_ref_*.
+w.r.t. (0, 0, 0) (sign-corrected). The jet tables sign the impact parameters w.r.t. event_ref_*,
+with the transverse components for dxy and d3 and the z components for dz (ip_signing =
+"transverse"): with the 3D dot product the z offset of the transverse PCA (the dz of the track,
+~mm) decides the sign and dilutes the lifetime asymmetry (N(sig > 3) / N(sig < -3) = 1.6
+instead of 2.6 in 1994_old).
 
 Other choices (decided 2026-11-08):
 - sqrt(s) is the nominal value of the config (91.2 GeV) for all events: RunInformation[0] (LEP
@@ -381,7 +385,10 @@ def process_file(filepath, cfg, sample, file_number):
         all_samples=[sample_cfg.get("label", sample)],
     )
     jet_tables = {
-        name: jt.build_jet_table(event_table, dict(algorithm), dict(cfg.jet_selection))
+        # the PCA is the transverse one, see the module docstring
+        name: jt.build_jet_table(
+            event_table, dict(algorithm), dict(cfg.jet_selection), ip_signing="transverse"
+        )
         for name, algorithm in cfg.jet_algorithms.items()
     }
     return event_table, jet_tables

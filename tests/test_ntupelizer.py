@@ -195,6 +195,12 @@ class TestAlephFile(unittest.TestCase):
                 self.assertTrue(ak.all(table.jet_energy > 1.0))
                 self.assertTrue(ak.all(table.jet_energy <= 91.2))
                 self.assertTrue(ak.all(abs(table.jet_eta) < 3.0))
+                # lifetime sign: positive excess at large significance. N(>3)/N(<-3) on this
+                # 1990 file (no VDET): 2.2 (R=0.4) and 1.9 (2-jet) with the transverse signing,
+                # 1.5 with the 3D dot product (1994_old: 2.6 vs 1.6)
+                tracks = table[table.jet_energy > 5]
+                sig = ak.to_numpy(ak.flatten(tracks.part_dxy_signed_sig[(tracks.part_has_track == 1) & (tracks.part_pt > 1)]))
+                self.assertGreater(np.mean(sig > 3), 1.75 * np.mean(sig < -3))
 
 
 if __name__ == "__main__":
